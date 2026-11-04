@@ -26,6 +26,22 @@ class FakeMcp:
         await send({"type": "http.response.body", "body": body})
 
 
+class FakeSession:
+    """Stands in for Plane's session endpoints: one signed-in cookie, and a switch for token creation."""
+
+    def __init__(self):
+        self.cookie = "plane-session-cookie"
+        self.created = []
+        self.can_create = True
+
+    async def who(self, cookie):
+        return {"name": "Анна Иванова", "email": "anna@narxoz.kz"} if cookie == self.cookie else None
+
+    async def create_token(self, cookie, label, expires_days=90):
+        self.created.append((cookie, label, expires_days))
+        return "good-token" if self.can_create and cookie == self.cookie else None
+
+
 @pytest.fixture
 def env(tmp_path):
     now = [1000.0]
@@ -37,8 +53,9 @@ def env(tmp_path):
         return pat in valid
 
     config = Config(public_base="https://jira-idtai.narxoz.kz", workspace_slug="narxoz", plane_base_url="http://plane")
-    app = create_app(config, store, mcp, validate_pat=validate, clock=lambda: now[0])
-    return type("Env", (), {"client": TestClient(app, base_url="https://jira-idtai.narxoz.kz"), "store": store, "mcp": mcp, "now": now, "config": config})
+    session = FakeSession()
+    app = create_app(config, store, mcp, validate_pat=validate, clock=lambda: now[0], plane_session=session)
+    return type("Env", (), {"client": TestClient(app, base_url="https://jira-idtai.narxoz.kz"), "store": store, "mcp": mcp, "now": now, "config": config, "session": session})
 
 
 def challenge_for(verifier):
@@ -202,3 +219,72 @@ def test_plane_tokens_are_stored_encrypted_and_codes_hashed(env, tmp_path):
 def test_pkce_check():
     assert pkce_ok("v" * 50, challenge_for("v" * 50))
     assert not pkce_ok("x" * 50, challenge_for("v" * 50))
+
+
+def authorize_params(client_id, verifier="v" * 50):
+    return {"client_id": client_id, "redirect_uri": REDIRECT, "response_type": "code", "code_challenge": challenge_for(verifier), "code_challenge_method": "S256", "state": "s1"}
+
+
+def csrf_of(page):
+    return re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
+
+
+def test_signed_in_visitor_sees_who_they_are_and_continues_without_a_token(env):
+    client_id = register(env)
+    env.client.cookies.set("session-id", env.session.cookie)
+    params = authorize_params(client_id)
+    page = env.client.get("/mcp/oauth/authorize", params=params)
+    assert "Анна Иванова" in page.text and "Разрешить" in page.text
+
+    response = env.client.post("/mcp/oauth/authorize", params=params, data={"csrf": csrf_of(page), "mode": "session"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    code = parse_qs(urlparse(response.headers["location"]).query)["code"][0]
+    assert env.session.created == [("plane-session-cookie", "MCP: ChatGPT", 90)]
+    tokens = env.client.post("/mcp/oauth/token", data={"grant_type": "authorization_code", "client_id": client_id, "code": code, "redirect_uri": REDIRECT, "code_verifier": "v" * 50}).json()
+    env.client.post("/mcp", json={}, headers={"Authorization": f"Bearer {tokens['access_token']}"})
+    assert env.mcp.seen[-1]["authorization"] == "Bearer good-token"
+    assert "plane-session-cookie" not in response.headers.get("location", "")   # the session cookie never leaves
+
+
+def test_a_visitor_who_is_not_signed_in_gets_a_link_to_plane_not_a_code(env):
+    client_id = register(env)
+    page = env.client.get("/mcp/oauth/authorize", params=authorize_params(client_id))
+    assert "Войти в Plane" in page.text
+    assert "next_path=" in page.text
+    assert 'name="mode"' not in page.text      # there is no "continue as" button without a session
+
+
+def test_continue_as_fails_cleanly_when_plane_refuses_to_make_a_token(env):
+    client_id = register(env)
+    env.session.can_create = False
+    env.client.cookies.set("session-id", env.session.cookie)
+    params = authorize_params(client_id)
+    page = env.client.get("/mcp/oauth/authorize", params=params)
+
+    response = env.client.post("/mcp/oauth/authorize", params=params, data={"csrf": csrf_of(page), "mode": "session"}, follow_redirects=False)
+
+    assert response.status_code == 401
+    assert "location" not in response.headers
+
+
+def test_continue_as_without_a_session_cookie_cannot_mint_a_code(env):
+    client_id = register(env)
+    params = authorize_params(client_id)
+    page = env.client.get("/mcp/oauth/authorize", params=params)
+
+    response = env.client.post("/mcp/oauth/authorize", params=params, data={"csrf": csrf_of(page), "mode": "session"}, follow_redirects=False)
+
+    assert response.status_code == 401
+
+
+def test_continue_as_needs_the_csrf_token_too(env):
+    client_id = register(env)
+    env.client.cookies.set("session-id", env.session.cookie)
+    params = authorize_params(client_id)
+    env.client.get("/mcp/oauth/authorize", params=params)
+
+    response = env.client.post("/mcp/oauth/authorize", params=params, data={"csrf": "forged", "mode": "session"}, follow_redirects=False)
+
+    assert response.status_code == 400
+    assert env.session.created == []

@@ -48,6 +48,8 @@ class Config:
     plane_base_url: str = ""              # internal URL of Plane's API, e.g. http://192.168.4.96:6767
     redirect_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_REDIRECT_PATTERNS))
     max_failed_logins: int = 10           # per client address and 10 minutes
+    session_cookie_name: str = "session-id"
+    token_days: int = 90                  # lifetime of the Plane API token the bridge creates for a user
 
     @property
     def issuer(self) -> str:
@@ -72,6 +74,45 @@ def pkce_ok(verifier: str, challenge: str) -> bool:
     return secrets.compare_digest(computed, challenge)
 
 
+class PlaneSession:
+    """Acts on Plane with the visitor's own session cookie (Plane and this bridge share one host, so the browser sends it).
+
+    `who` tells who is signed in; `create_token` makes a personal API token for that person, exactly what the "API tokens"
+    page of Plane does. The cookie is used for these two calls only and is never stored."""
+
+    def __init__(self, config: Config):
+        self.base = config.plane_base_url.rstrip("/")
+        self.origin = config.public_base
+        self.cookie_name = config.session_cookie_name
+
+    def _headers(self, cookie: str) -> dict[str, str]:
+        # Plane checks Origin/Referer of state-changing requests against its own web address.
+        return {"Cookie": f"{self.cookie_name}={cookie}", "Origin": self.origin, "Referer": self.origin + "/", "Accept": "application/json"}
+
+    async def who(self, cookie: str) -> dict | None:
+        if not cookie:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(f"{self.base}/api/users/me/", headers=self._headers(cookie))
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            return {"name": data.get("display_name") or data.get("email") or "", "email": data.get("email", "")}
+        except (httpx.HTTPError, ValueError):
+            return None
+
+    async def create_token(self, cookie: str, label: str, expires_days: int = 90) -> str | None:
+        expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + expires_days * 86400))
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(f"{self.base}/api/users/api-tokens/", headers=self._headers(cookie),
+                                      json={"label": label[:100], "description": "Создан шлюзом MCP при входе через Plane. Можно отозвать здесь.", "expired_at": expires})
+            return r.json().get("token") if r.status_code == 201 else None
+        except (httpx.HTTPError, ValueError):
+            return None
+
+
 def plane_validator(config: Config) -> ValidatePat:
     async def validate(pat: str) -> bool:
         try:
@@ -88,21 +129,31 @@ def plane_validator(config: Config) -> ValidatePat:
     return validate
 
 
-FORM = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+CONSENT = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Доступ к Plane</title><style>body{{font:16px/1.5 system-ui,sans-serif;max-width:34rem;margin:3rem auto;padding:0 1rem}}
-input{{width:100%;padding:.6rem;font:inherit;box-sizing:border-box}}button{{padding:.6rem 1rem;font:inherit;margin-top:1rem}}.err{{color:#b00020}}</style></head>
+button{{padding:.7rem 1.2rem;font:inherit;margin-top:1rem;cursor:pointer}}details{{margin-top:2rem}}input{{width:100%;padding:.6rem;font:inherit;box-sizing:border-box}}.err{{color:#b00020}}a{{color:#0b57d0}}</style></head>
 <body><h1>Доступ к Plane</h1><p>Приложение <strong>{client}</strong> просит разрешение читать и менять задачи в Plane от вашего имени.</p>
-<p>Вставьте ваш личный API-токен Plane (Profile settings → API tokens). Приложение получит те же права, что у вас в Plane, не больше.</p>
-{error}<form method="post"><input type="hidden" name="csrf" value="{csrf}"><label for="t">API-токен Plane</label>
-<input id="t" name="token" type="password" autocomplete="off" required><button type="submit">Разрешить</button></form></body></html>"""
+{body}
+<details><summary>Или вставить личный API-токен вручную</summary><form method="post"><input type="hidden" name="csrf" value="{csrf}">
+<p><label for="t">API-токен Plane (Profile settings → API tokens)</label></p><input id="t" name="token" type="password" autocomplete="off"><button type="submit">Разрешить с токеном</button></form></details>
+</body></html>"""
+
+SIGNED_IN = """<p>Вы вошли в Plane как <strong>{who}</strong>.</p>
+<form method="post"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="mode" value="session">
+<button type="submit">Разрешить</button></form>
+<p>Приложение получит те же права, что у вас в Plane, не больше. Доступ можно отозвать в Plane: Profile settings → API tokens.</p>"""
+
+SIGN_IN = """{error}<p>Сначала войдите в Plane в этом браузере, потом вернитесь на эту страницу.</p>
+<p><a href="{login}" target="_blank" rel="noopener">Войти в Plane</a> (откроется в новой вкладке), затем <a href="">обновите эту страницу</a>.</p>"""
 
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 PAGE_HEADERS = {**NO_STORE, "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https: http://localhost:* http://127.0.0.1:* cursor:; frame-ancestors 'none'",
                 "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
 
 
-def create_app(config: Config, store: Store, header_app, validate_pat: ValidatePat | None = None, clock=time.time) -> Starlette:
+def create_app(config: Config, store: Store, header_app, validate_pat: ValidatePat | None = None, clock=time.time, plane_session=None) -> Starlette:
     validate = validate_pat or plane_validator(config)
+    session = plane_session or PlaneSession(config)
     failures: dict[str, list[float]] = {}
 
     def too_many(ip: str) -> bool:
@@ -149,28 +200,46 @@ def create_app(config: Config, store: Store, header_app, validate_pat: ValidateP
             return None, "Нужен response_type=code и PKCE (S256)."
         return (client, redirect_uri, q.get("code_challenge", ""), q.get("state", "")), None
 
+    def page(client_name: str, body: str, csrf: str, status: int = 200) -> HTMLResponse:
+        return HTMLResponse(CONSENT.format(client=html.escape(client_name), body=body, csrf=csrf), status_code=status, headers=PAGE_HEADERS)
+
     async def authorize(request: Request) -> Response:
         params, problem = authorize_params(request)
         if problem:
             return HTMLResponse(f"<h1>Ошибка</h1><p>{html.escape(problem)}</p>", status_code=400, headers=PAGE_HEADERS)
         client, redirect_uri, challenge, state = params
         ip = request.client.host if request.client else "?"
+        cookie = request.cookies.get(config.session_cookie_name, "")
         if request.method == "GET":
             csrf = secrets.token_urlsafe(24)
-            response = HTMLResponse(FORM.format(client=html.escape(client.name), csrf=csrf, error=""), headers=PAGE_HEADERS)
+            who = await session.who(cookie)
+            if who:
+                body = SIGNED_IN.format(who=html.escape(who["name"] or who["email"]), csrf=csrf)
+            else:
+                login = f"{config.public_base}/?" + urlencode({"next_path": str(request.url.path) + "?" + str(request.url.query)})
+                body = SIGN_IN.format(error="", login=html.escape(login))
+            response = page(client.name, body, csrf)
             response.set_cookie("mcp_csrf", csrf, httponly=True, secure=config.public_base.startswith("https"), samesite="strict", max_age=600, path=config.prefix + "/oauth")
             return response
         form = await request.form()
-        cookie = request.cookies.get("mcp_csrf", "")
-        if not cookie or not secrets.compare_digest(cookie, str(form.get("csrf", ""))):
+        csrf_cookie = request.cookies.get("mcp_csrf", "")
+        if not csrf_cookie or not secrets.compare_digest(csrf_cookie, str(form.get("csrf", ""))):
             return HTMLResponse("<h1>Ошибка</h1><p>Сессия формы устарела, откройте ссылку заново.</p>", status_code=400, headers=PAGE_HEADERS)
         if too_many(ip):
             return HTMLResponse("<h1>Слишком много попыток</h1><p>Подождите 10 минут.</p>", status_code=429, headers=PAGE_HEADERS)
+
         token = str(form.get("token", "")).strip()
-        if not token or not await validate(token):
+        if form.get("mode") == "session" and not token:
+            # "Continue as <you>": the bridge makes a Plane API token for the signed-in person, then forgets the cookie.
+            token = await session.create_token(cookie, f"MCP: {client.name}", config.token_days) or ""
+            if not token or not await validate(token):
+                failures.setdefault(ip, []).append(clock())
+                error = '<p class="err">Не удалось получить доступ через ваш вход в Plane. Войдите в Plane заново или вставьте токен ниже.</p>'
+                return page(client.name, SIGN_IN.format(error=error, login=html.escape(config.public_base + "/")), csrf_cookie, 401)
+        elif not token or not await validate(token):
             failures.setdefault(ip, []).append(clock())
             error = '<p class="err">Plane не принял этот токен или у него нет доступа к рабочему пространству.</p>'
-            return HTMLResponse(FORM.format(client=html.escape(client.name), csrf=cookie, error=error), status_code=401, headers=PAGE_HEADERS)
+            return page(client.name, SIGN_IN.format(error=error, login=html.escape(config.public_base + "/")), csrf_cookie, 401)
         code = store.make_code(client.client_id, redirect_uri, challenge, token)
         query = {"code": code, **({"state": state} if state else {})}
         separator = "&" if "?" in redirect_uri else "?"
