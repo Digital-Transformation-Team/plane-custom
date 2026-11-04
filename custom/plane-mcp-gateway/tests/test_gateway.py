@@ -21,6 +21,7 @@ class FakeMcp:
 
     async def __call__(self, scope, receive, send):
         self.seen.append({k.decode(): v.decode() for k, v in scope["headers"]})
+        await receive()                                   # a real MCP app reads the request body
         body = b'{"ok":true}'
         await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
         await send({"type": "http.response.body", "body": body})
@@ -288,3 +289,20 @@ def test_continue_as_needs_the_csrf_token_too(env):
 
     assert response.status_code == 400
     assert env.session.created == []
+
+
+def test_every_mcp_call_is_logged_without_secrets(env, caplog):
+    import logging as _l
+    caplog.set_level(_l.INFO, logger="gateway")
+    client_id = register(env)
+    response, verifier = login(env, client_id)
+    code = parse_qs(urlparse(response.headers["location"]).query)["code"][0]
+    tokens = env.client.post("/mcp/oauth/token", data={"grant_type": "authorization_code", "client_id": client_id, "code": code, "redirect_uri": REDIRECT, "code_verifier": verifier}).json()
+
+    env.client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers={"Authorization": f"Bearer {tokens['access_token']}"})
+    env.client.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "initialize"})
+
+    lines = [r.message for r in caplog.records if r.name == "gateway"]
+    assert any('"rpc": "tools/list"' in l and '"status": 200' in l for l in lines)
+    assert any('"status": 401' in l for l in lines)
+    assert not any(tokens["access_token"] in l or "good-token" in l for l in lines)

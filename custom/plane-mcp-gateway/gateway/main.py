@@ -1,6 +1,7 @@
 """Process entry point: reads the configuration from the environment and serves the bridge with uvicorn."""
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
@@ -36,4 +37,5 @@ def build():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     uvicorn.run(build(), host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), proxy_headers=True, forwarded_allow_ips="*", access_log=False)

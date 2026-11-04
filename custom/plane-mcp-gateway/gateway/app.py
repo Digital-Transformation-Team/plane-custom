@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import fnmatch
+import logging
 import hashlib
 import html
 import json
@@ -38,6 +39,7 @@ DEFAULT_REDIRECT_PATTERNS = [
 ]
 
 ValidatePat = Callable[[str], Awaitable[bool]]
+log = logging.getLogger("gateway")
 
 
 @dataclass
@@ -270,23 +272,50 @@ def create_app(config: Config, store: Store, header_app, validate_pat: ValidateP
         return JSONResponse({"access_token": access, "token_type": "Bearer", "expires_in": 3600, "refresh_token": refresh}, headers=NO_STORE)
 
     class McpBridge:
-        """ASGI: swaps the opaque OAuth access token for the user's Plane token, then calls the official MCP app."""
+        """ASGI: swaps the opaque OAuth access token for the user's Plane token, then calls the official MCP app.
+        One log line per MCP call (method, path, JSON-RPC method, status, duration, client): no tokens, no payloads."""
 
         async def __call__(self, scope, receive, send):
             if scope["type"] != "http":
                 await header_app(scope, receive, send)
                 return
+            started = time.time()
             headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+            seen = {"status": 0, "rpc": "", "ctype": ""}
+
+            def note():
+                log.info(json.dumps({"ev": "mcp", "method": scope["method"], "path": scope["path"], "rpc": seen["rpc"], "status": seen["status"],
+                                     "ctype": seen["ctype"], "ms": int((time.time() - started) * 1000), "ua": headers.get("user-agent", "")[:60]}))
+
+            async def logged_send(message):
+                if message["type"] == "http.response.start":
+                    seen["status"] = message["status"]
+                    seen["ctype"] = next((v.decode() for k, v in message.get("headers", []) if k.lower() == b"content-type"), "")
+                await send(message)
+
+            async def logged_receive():
+                message = await receive()
+                if message["type"] == "http.request" and not seen["rpc"]:
+                    try:
+                        seen["rpc"] = str(json.loads(message.get("body") or b"{}").get("method", ""))
+                    except (ValueError, AttributeError):
+                        seen["rpc"] = "?"
+                return message
+
             auth = headers.get("authorization", "")
             pat = store.pat_for_access(auth[7:].strip()) if auth.lower().startswith("bearer ") else None
             if not pat:
                 response = JSONResponse({"error": "invalid_token"}, status_code=401,
                                         headers={"WWW-Authenticate": f'Bearer resource_metadata="{config.resource_metadata_url}"', **NO_STORE})
-                await response(scope, receive, send)
+                await response(scope, receive, logged_send)
+                note()
                 return
             rewritten = [(k, v) for k, v in scope["headers"] if k.lower() not in (b"authorization", b"x-workspace-slug", b"x-api-key")]
             rewritten += [(b"authorization", f"Bearer {pat}".encode()), (b"x-workspace-slug", config.workspace_slug.encode())]
-            await header_app({**scope, "headers": rewritten}, receive, send)
+            try:
+                await header_app({**scope, "headers": rewritten}, logged_receive, logged_send)
+            finally:
+                note()
 
     async def health(_: Request) -> JSONResponse:
         return JSONResponse({"ok": True})
